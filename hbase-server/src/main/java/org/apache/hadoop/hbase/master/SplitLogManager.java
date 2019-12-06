@@ -33,14 +33,18 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -248,7 +252,7 @@ public class SplitLogManager {
    */
   public long splitLogDistributed(final Set<ServerName> serverNames, final List<Path> logDirs,
       PathFilter filter) throws IOException {
-    MonitoredTask status = TaskMonitor.get().createStatus("Doing distributed log split in " +
+    final MonitoredTask status = TaskMonitor.get().createStatus("Doing distributed log split in " +
       logDirs + " for serverName=" + serverNames);
     FileStatus[] logfiles = getFileList(logDirs, filter);
     status.setStatus("Checking directory contents...");
@@ -257,7 +261,7 @@ public class SplitLogManager {
       " for " + serverNames);
     long t = EnvironmentEdgeManager.currentTime();
     long totalSize = 0;
-    TaskBatch batch = new TaskBatch();
+    final TaskBatch batch = new TaskBatch();
     Boolean isMetaRecovery = (filter == null) ? null : false;
     for (FileStatus lf : logfiles) {
       // TODO If the log file is still being written to - which is most likely
@@ -271,50 +275,103 @@ public class SplitLogManager {
         throw new IOException("duplicate log split scheduled for " + lf.getPath());
       }
     }
-    waitForSplittingCompletion(batch, status);
+
     // remove recovering regions
     if (filter == MasterFileSystem.META_FILTER /* reference comparison */) {
       // we split meta regions and user regions separately therefore logfiles are either all for
       // meta or user regions but won't for both( we could have mixed situations in tests)
       isMetaRecovery = true;
     }
-    removeRecoveringRegions(serverNames, isMetaRecovery);
 
-    if (batch.done != batch.installed) {
-      batch.isDead = true;
-      SplitLogCounters.tot_mgr_log_split_batch_err.incrementAndGet();
-      LOG.warn("error while splitting logs in " + logDirs + " installed = " + batch.installed
-          + " but only " + batch.done + " done");
-      String msg = "error or interrupted while splitting logs in " + logDirs + " Task = " + batch;
-      status.abort(msg);
-      throw new IOException(msg);
-    }
-    for (Path logDir : logDirs) {
-      status.setStatus("Cleaning up log directory...");
-      final FileSystem fs = logDir.getFileSystem(conf);
-      try {
-        if (fs.exists(logDir) && !fs.delete(logDir, false)) {
-          LOG.warn("Unable to delete log src dir. Ignoring. " + logDir);
-        }
-      } catch (IOException ioe) {
-        FileStatus[] files = fs.listStatus(logDir);
-        if (files != null && files.length > 0) {
-          LOG.warn("Returning success without actually splitting and "
-              + "deleting all the log files in path " + logDir + ": "
-              + Arrays.toString(files), ioe);
-        } else {
-          LOG.warn("Unable to delete log src dir. Ignoring. " + logDir, ioe);
-        }
+    final Callable<Void> afterHandler = getAfterSplitHandler(serverNames, logDirs, batch, status, isMetaRecovery, totalSize, t);
+    if (!isMetaRecovery) {
+      LOG.info("conf hbase.hlog.async.split.enable is true, use async split WAL LOG");
+      final Path walRootDir = FSUtils.getWALRootDir(conf);
+      final FileSystem fs  = walRootDir.getFileSystem(conf);
+      try (FSDataOutputStream ignored = fs.create(new Path(walRootDir, "splitting.lock"))) {
+      } catch (IOException e) {
+        LOG.error("create splitting.lock error", e);
+        throw e;
       }
-      SplitLogCounters.tot_mgr_log_split_batch_success.incrementAndGet();
+      ExecutorService pool = Executors.newSingleThreadExecutor();
+      pool.submit(new Callable<Void>() {
+        @Override
+        public Void call()
+                throws Exception
+        {
+          waitForSplittingCompletion(batch, status);
+          if (fs.delete(new Path(walRootDir, "splitting.lock"), true)){
+            LOG.info("delete splitting.lock, wal hlog splitting done.");
+          } else {
+            LOG.error("wal log splitting done, but delete splitting.lock failed. " +
+                    "This will cause the regionServer will not be able to replay of the Hlog ");
+          }
+          return afterHandler.call();
+        }
+      });
+      pool.shutdown();
+    } else {
+      waitForSplittingCompletion(batch, status);
+      try {
+        afterHandler.call();
+      }
+      catch (IOException | RuntimeException e){
+        throw e;
+      }
+      catch (Exception e) {
+        throw new RuntimeException(e);
+      }
     }
-    String msg =
-        "finished splitting (more than or equal to) " + totalSize + " bytes in " + batch.installed
-            + " log files in " + logDirs + " in "
-            + (EnvironmentEdgeManager.currentTime() - t) + "ms";
-    status.markComplete(msg);
-    LOG.info(msg);
+
     return totalSize;
+  }
+
+  private Callable<Void> getAfterSplitHandler(final Set<ServerName> serverNames, final List<Path> logDirs, final TaskBatch batch,
+          final MonitoredTask status, final Boolean isMetaRecovery,final long totalSize ,final long t) {
+    return new Callable<Void>() {
+      @Override
+      public Void call()
+              throws Exception
+      {
+        removeRecoveringRegions(serverNames, isMetaRecovery);
+
+        if (batch.done != batch.installed) {
+          batch.isDead = true;
+          SplitLogCounters.tot_mgr_log_split_batch_err.incrementAndGet();
+          LOG.warn("error while splitting logs in " + logDirs + " installed = " + batch.installed
+                  + " but only " + batch.done + " done");
+          String msg = "error or interrupted while splitting logs in " + logDirs + " Task = " + batch;
+          status.abort(msg);
+          throw new IOException(msg);
+        }
+        for (Path logDir : logDirs) {
+          status.setStatus("Cleaning up log directory...");
+          final FileSystem fs = logDir.getFileSystem(conf);
+          try {
+            if (fs.exists(logDir) && !fs.delete(logDir, false)) {
+              LOG.warn("Unable to delete log src dir. Ignoring. " + logDir);
+            }
+          } catch (IOException ioe) {
+            FileStatus[] files = fs.listStatus(logDir);
+            if (files != null && files.length > 0) {
+              LOG.warn("Returning success without actually splitting and "
+                      + "deleting all the log files in path " + logDir + ": "
+                      + Arrays.toString(files), ioe);
+            } else {
+              LOG.warn("Unable to delete log src dir. Ignoring. " + logDir, ioe);
+            }
+          }
+          SplitLogCounters.tot_mgr_log_split_batch_success.incrementAndGet();
+        }
+        String msg =
+                "finished splitting (more than or equal to) " + totalSize + " bytes in " + batch.installed
+                        + " log files in " + logDirs + " in "
+                        + (EnvironmentEdgeManager.currentTime() - t) + "ms";
+        status.markComplete(msg);
+        LOG.info(msg);
+        return null;
+      }
+    };
   }
 
   /**

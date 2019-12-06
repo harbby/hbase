@@ -203,6 +203,8 @@ import org.apache.hadoop.util.StringUtils;
 import org.apache.htrace.Trace;
 import org.apache.htrace.TraceScope;
 
+import static org.apache.hadoop.hbase.NamespaceDescriptor.SYSTEM_NAMESPACE_NAME_STR;
+
 @InterfaceAudience.Private
 public class HRegion implements HeapSize, PropagatingConfigurationObserver, Region {
   private static final Log LOG = LogFactory.getLog(HRegion.class);
@@ -415,6 +417,9 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
     // static in the lifetime of the region, while readsEnabled is dynamic
     volatile boolean readsEnabled = true;
 
+    // must default is false
+    volatile boolean replayHlogRunning = false;
+
     /**
      * Set flags that make this region read-only.
      *
@@ -423,6 +428,15 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
     synchronized void setReadOnly(final boolean onOff) {
       this.writesEnabled = !onOff;
       this.readOnly = onOff;
+    }
+
+    synchronized void setReplayHlogRunning(final boolean running) {
+      this.replayHlogRunning = running;
+    }
+
+    boolean isReplayHlogRunning()
+    {
+      return replayHlogRunning;
     }
 
     boolean isReadOnly() {
@@ -760,7 +774,7 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
 
     // disable stats tracking system tables, but check the config for everything else
     this.regionStatsEnabled = htd.getTableName().getNamespaceAsString().equals(
-        NamespaceDescriptor.SYSTEM_NAMESPACE_NAME_STR) ?
+        SYSTEM_NAMESPACE_NAME_STR) ?
           false :
           conf.getBoolean(HConstants.ENABLE_CLIENT_BACKPRESSURE,
               HConstants.DEFAULT_ENABLE_CLIENT_BACKPRESSURE);
@@ -851,6 +865,52 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
     long maxSeqId = initializeStores(reporter, status);
     this.mvcc.advanceTo(maxSeqId);
     if (ServerRegionReplicaUtil.shouldReplayRecoveredEdits(this)) {
+      final HRegionInfo regionInfo = this.getRegionInfo();
+      final boolean enableAsyncSplit = conf.getBoolean("hbase.hlog.async.split.enable", false);
+      boolean syncLoad = !conf.getBoolean("hbase.hlog.async.replay.enable", false) &&
+              !enableAsyncSplit;
+
+      if(SYSTEM_NAMESPACE_NAME_STR.equals(regionInfo.getTable().getNamespaceAsString()) || syncLoad){
+        // Recover any edits if available.
+        maxSeqId = Math.max(maxSeqId,
+                replayRecoveredEditsIfAny(maxSeqIdInStores, reporter, status));
+        // Make sure mvcc is up to max.
+        this.mvcc.advanceTo(maxSeqId);
+      }else {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        final long copyMaxSeqId = maxSeqId;
+        writestate.setReplayHlogRunning(true);
+        pool.submit(new Callable<Void>() {
+          @Override
+          public Void call()
+                  throws Exception
+          {
+            Thread.currentThread().setName("replaying-" + regionInfo.getTable()
+                    + "-thread" + "-" + Thread.currentThread().getId());
+            if (enableAsyncSplit) {
+              final Path walRootDir = FSUtils.getWALRootDir(conf);
+              final FileSystem fs  = walRootDir.getFileSystem(conf);
+              while (fs.exists(new Path(walRootDir, "splitting.lock"))){
+                LOG.info("exists splitting.lock, waiting WAL Hlog splitting done");
+                TimeUnit.MILLISECONDS.sleep(3000);
+              }
+            }
+
+            LOG.info("begin replay " + regionInfo + "acl hlog");
+            long id = Math.max(copyMaxSeqId,
+                    replayRecoveredEditsIfAny(maxSeqIdInStores, reporter, status));
+            // Make sure mvcc is up to max.
+            HRegion.this.mvcc.advanceTo(id);
+            writestate.setReplayHlogRunning(false);
+            LOG.info("region: " + regionInfo + " async replay hlog done");
+            return null;
+          }
+        });
+        pool.shutdown();
+      }
+
+
+
       // Recover any edits if available.
       maxSeqId = Math.max(maxSeqId,
         replayRecoveredEditsIfAny(maxSeqIdInStores, reporter, status));
@@ -3918,6 +3978,10 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
   protected void checkReadOnly() throws IOException {
     if (isReadOnly()) {
       throw new DoNotRetryIOException("region is read only");
+    }
+
+    if (this.writestate.isReplayHlogRunning()){
+      throw new DoNotRetryIOException("region is read only, async load WAL Hlog task is running");
     }
   }
 
